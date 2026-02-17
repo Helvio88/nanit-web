@@ -1,6 +1,7 @@
 package mqtt
 
 import (
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -21,12 +22,14 @@ type Connection struct {
 	client                    MQTT.Client
 	sendLightCommandHandler   SendLightCommandHandler
 	sendStandbyCommandHandler SendStandbyCommandHandler
+	publishedDiscoveries      map[string]bool
 }
 
 // NewConnection - constructor
 func NewConnection(opts Opts) *Connection {
 	return &Connection{
 		Opts: opts,
+		publishedDiscoveries: make(map[string]bool),
 	}
 }
 
@@ -152,6 +155,93 @@ func (conn *Connection) subscribeToStandbyCommand() {
 	}
 }
 
+// publishDiscovery publishes Home Assistant MQTT discovery messages for sensors and switches
+func (conn *Connection) publishDiscovery(babyUID string, state baby.State) {
+	// Build device info
+	device := map[string]interface{}{
+		"identifiers": []string{babyUID},
+		"name":        fmt.Sprintf("Nanit %s", babyUID),
+		"manufacturer": "Nanit",
+	}
+
+	if state.DeviceInfo != nil {
+		if state.DeviceInfo.FirmwareVersion != nil {
+			device["sw_version"] = *state.DeviceInfo.FirmwareVersion
+		}
+		if state.DeviceInfo.HardwareVersion != nil {
+			device["model"] = *state.DeviceInfo.HardwareVersion
+		}
+	}
+
+	// Helper to publish retained JSON to discovery topic
+	publishConfig := func(topic string, payload interface{}) {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			log.Error().Err(err).Str("topic", topic).Msg("Failed to marshal discovery payload")
+			return
+		}
+
+		token := conn.client.Publish(topic, 0, true, b)
+		if token.Wait(); token.Error() != nil {
+			log.Error().Err(token.Error()).Str("topic", topic).Msg("Failed to publish discovery payload")
+		} else {
+			log.Info().Str("topic", topic).Msg("Published Home Assistant discovery payload")
+		}
+	}
+
+	nodePrefix := fmt.Sprintf("%s_%s", conn.Opts.TopicPrefix, babyUID)
+
+	// Temperature sensor
+	tempTopic := fmt.Sprintf("homeassistant/sensor/%s_temperature/config", nodePrefix)
+	tempPayload := map[string]interface{}{
+		"name":              fmt.Sprintf("Nanit %s Temperature", babyUID),
+		"unique_id":         fmt.Sprintf("%s_temperature", nodePrefix),
+		"state_topic":       fmt.Sprintf("%s/babies/%s/temperature", conn.Opts.TopicPrefix, babyUID),
+		"unit_of_measurement": "°C",
+		"device_class":      "temperature",
+		"device":            device,
+	}
+	publishConfig(tempTopic, tempPayload)
+
+	// Humidity sensor
+	humTopic := fmt.Sprintf("homeassistant/sensor/%s_humidity/config", nodePrefix)
+	humPayload := map[string]interface{}{
+		"name":        fmt.Sprintf("Nanit %s Humidity", babyUID),
+		"unique_id":   fmt.Sprintf("%s_humidity", nodePrefix),
+		"state_topic": fmt.Sprintf("%s/babies/%s/humidity", conn.Opts.TopicPrefix, babyUID),
+		"unit_of_measurement": "%",
+		"device_class": "humidity",
+		"device":      device,
+	}
+	publishConfig(humTopic, humPayload)
+
+	// Night light switch
+	nlTopic := fmt.Sprintf("homeassistant/switch/%s_night_light/config", nodePrefix)
+	nlPayload := map[string]interface{}{
+		"name":         fmt.Sprintf("Nanit %s Night Light", babyUID),
+		"unique_id":    fmt.Sprintf("%s_night_light", nodePrefix),
+		"state_topic":  fmt.Sprintf("%s/babies/%s/night_light", conn.Opts.TopicPrefix, babyUID),
+		"command_topic": fmt.Sprintf("%s/babies/%s/night_light/switch", conn.Opts.TopicPrefix, babyUID),
+		"payload_on":   "true",
+		"payload_off":  "false",
+		"device":       device,
+	}
+	publishConfig(nlTopic, nlPayload)
+
+	// Standby switch
+	stTopic := fmt.Sprintf("homeassistant/switch/%s_standby/config", nodePrefix)
+	stPayload := map[string]interface{}{
+		"name":         fmt.Sprintf("Nanit %s Standby", babyUID),
+		"unique_id":    fmt.Sprintf("%s_standby", nodePrefix),
+		"state_topic":  fmt.Sprintf("%s/babies/%s/standby", conn.Opts.TopicPrefix, babyUID),
+		"command_topic": fmt.Sprintf("%s/babies/%s/standby/switch", conn.Opts.TopicPrefix, babyUID),
+		"payload_on":   "true",
+		"payload_off":  "false",
+		"device":       device,
+	}
+	publishConfig(stTopic, stPayload)
+}
+
 func runMqtt(conn *Connection, attempt utils.AttemptContext) {
 
 	if token := conn.client.Connect(); token.Wait() && token.Error() != nil {
@@ -163,6 +253,12 @@ func runMqtt(conn *Connection, attempt utils.AttemptContext) {
 	log.Info().Str("broker_url", conn.Opts.BrokerURL).Msg("Successfully connected to MQTT broker")
 
 	unsubscribe := conn.StateManager.Subscribe(func(babyUID string, state baby.State) {
+		// Publish Home Assistant MQTT discovery for this baby once
+		if _, ok := conn.publishedDiscoveries[babyUID]; !ok {
+			conn.publishDiscovery(babyUID, state)
+			conn.publishedDiscoveries[babyUID] = true
+		}
+
 		publish := func(key string, value interface{}) {
 			topic := fmt.Sprintf("%v/babies/%v/%v", conn.Opts.TopicPrefix, babyUID, key)
 			log.Trace().Str("topic", topic).Interface("value", value).Msg("MQTT publish")
