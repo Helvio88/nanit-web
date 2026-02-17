@@ -218,7 +218,8 @@ class ApiClient {
   getHLSUrl(babyUid: string): string {
     const host = typeof window !== 'undefined' ? window.location.hostname : 'localhost';
     const port = typeof window !== 'undefined' ? window.location.port : '8080';
-    return `http://${host}:${port}/api/stream/hls/${babyUid}/playlist.m3u8`;
+    const prot = window.location.protocol === 'https:' ? 'https' : 'http';
+    return `${prot}://${host}:${port}/api/stream/hls/${babyUid}/playlist.m3u8`;
   }
 
   // Web Authentication
